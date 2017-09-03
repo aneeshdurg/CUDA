@@ -1,13 +1,11 @@
 CXX ?= g++
 CFLAGS = -m32 -Wall -Wconversion -O3 -fPIC
 LIBFLAGS = -lmkl_intel -lmkl_intel_thread -lmkl_core -liomp5 -lpthread -lm
+GNUSOURCE = -U_GNU_SOURCE
 SHVER = 2
 OS = $(shell uname)
 
 all: svm-train 
-
-threaded:
-	make -f Makefile.threaded 
 
 lib: svm.o
 	if [ "$(OS)" = "Darwin" ]; then \
@@ -18,10 +16,13 @@ lib: svm.o
 	$(CXX) $${SHARED_LIB_FLAG} svm.o -o libsvm.so.$(SHVER)
 
 svm-train: svm-train.c svm.o
-	$(CXX) $(CFLAGS) svm-train.c svm.o -o svm-train -Wno-float-conversion $(LIBFLAGS)
+	$(CXX) $(CFLAGS) svm-train.c svm.o task_queue.o -o svm-train -Wno-float-conversion $(LIBFLAGS)
 
-svm.o: svm.cpp svm.h
-	$(CXX) $(CFLAGS) -c svm.cpp -U_GNU_SOURCE
+svm.o: svm.cpp svm.h task_queue.o
+	$(CXX) $(CFLAGS) -c svm_threaded.cpp -o svm.o $(GNUSOURCE) $(LIBFLAGS) 
+
+task_queue.o: task_queue.cpp task_queue.h
+	$(CXX) $(CFLAGS) -c task_queue.cpp -lpthread
 
 clean:
-	rm -f *~ *.o svm-train libsvm.so.$(SHVER)
+	rm -f *~ svm.o task_queue.o svm-train libsvm.so.$(SHVER)

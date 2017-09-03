@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,8 +8,14 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <locale.h>
+#include <pthread.h>
+#include <mkl.h>
+#include <sched.h>
+#include <unistd.h>
 
 #include "svm.h"
+#include "task_queue.h"
+
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
@@ -1694,15 +1701,6 @@ static void solve_nu_svr(
 	delete[] y;
 }
 
-//
-// decision_function
-//
-struct decision_function
-{
-	double *alpha;
-	double rho;	
-};
-
 static decision_function svm_train_one(
 	const svm_problem *prob, const svm_parameter *param,
 	double Cp, double Cn)
@@ -2156,8 +2154,92 @@ static void svm_group_classes(const svm_problem *prob, int *nr_class_ret, int **
 //
 // Interface functions
 //
+
+//info is a pointer to an svm_common_info
+void* thread_svm_train(void* info){
+	svm_common_info *com_info = (svm_common_info*)info;
+	task_queue *q = com_info->q;
+	double **weighted_C = com_info->weighted_C;
+	const svm_parameter *param = com_info->param;
+	double **probA = com_info->probA,
+			**probB = com_info->probB;
+	decision_function **f = com_info->f;	
+#ifdef _DENSE_REP
+	svm_node *x = com_info->x;	
+#else
+	svm_node **x = com_info->x; 
+#endif
+	while(1){
+		svm_task *s_task = queue_get(q);
+		if(!s_task){
+			break;
+		}
+		int p = s_task->id;
+		int sj = s_task->sj, cj = s_task->cj,
+			si = s_task->si, ci = s_task->ci;
+		int i = s_task->i, j = s_task->j;
+
+		svm_problem sub_prob;
+		sub_prob.l = ci+cj;
+#ifdef _DENSE_REP
+		sub_prob.x = Malloc(svm_node,sub_prob.l);
+#else
+		sub_prob.x = Malloc(svm_node *,sub_prob.l);
+#endif
+		sub_prob.y = Malloc(double,sub_prob.l);
+		int k;
+		for(k=0;k<ci;k++)
+		{
+			sub_prob.x[k] = x[si+k];
+			sub_prob.y[k] = +1;
+		}
+		for(k=0;k<cj;k++)
+		{
+			sub_prob.x[ci+k] = x[sj+k];
+			sub_prob.y[ci+k] = -1;
+		}
+
+		if(param->probability)
+			svm_binary_svc_probability(&sub_prob,param,(*weighted_C)[i],(*weighted_C)[j],(*probA)[p],(*probB)[p]);
+
+		(*f)[p] = svm_train_one(&sub_prob,param,(*weighted_C)[i],(*weighted_C)[j]);
+		free(sub_prob.x);
+		free(sub_prob.y);
+		free(s_task);
+	}
+	return NULL;
+}
+
+//n is the number of threads to be spawned, info is the common info
+// for each thread
+// there will be as many threads as cores, and the affinity of each
+// will be set to a unique core.
+pthread_t* spawn_threads(int n, svm_common_info *info){
+	pthread_t* tids = new pthread_t[n];
+	cpu_set_t cpuset;
+	for(int i = 0; i < n; i++){
+		CPU_ZERO(&cpuset);
+		CPU_SET(i, &cpuset);
+		pthread_create(tids+i, NULL, thread_svm_train, (void*)info);
+		pthread_setaffinity_np(tids[i], sizeof(cpu_set_t), &cpuset);
+	}
+	return tids;
+};
+
+//Each of the threads will recieve a poison pill before
+//it completes, allowing join to clean up the threads
+void join_threads(pthread_t *tids, task_queue *q, int n_threads){
+	for(int i = 0; i<n_threads; i++){
+		queue_put(q, NULL);
+	}
+	for(int i = 0; i<n_threads; i++){
+		pthread_join(tids[i], NULL);
+	}
+};
+
 svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 {
+  //printf("CALLED SVM_TRAIN\n");
 	svm_model *model = Malloc(svm_model,1);
 	model->param = *param;
 	model->free_sv = 0;	// XXX
@@ -2261,51 +2343,66 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 			probB=Malloc(double,nr_class*(nr_class-1)/2);
 		}
 
+		int n_threads = sysconf(_SC_NPROCESSORS_ONLN); //number of threads==number of cores
+		task_queue* q = queue_create();
+
+		svm_common_info* com_info = Malloc(svm_common_info, 1);
+		com_info->weighted_C = &weighted_C;
+		com_info->param = param;
+		com_info->probA = &probA;
+		com_info->probB = &probB;
+		com_info->f = &f; 
+		com_info->x = x;
+		com_info->q = q;
+		pthread_t *tids = spawn_threads(n_threads, com_info);
 		int p = 0;
 		for(i=0;i<nr_class;i++)
+		{
+			int si = start[i];	
+			int ci = count[i];
 			for(int j=i+1;j<nr_class;j++)
 			{
-				svm_problem sub_prob;
-				int si = start[i], sj = start[j];
-				int ci = count[i], cj = count[j];
-				sub_prob.l = ci+cj;
-#ifdef _DENSE_REP
-				sub_prob.x = Malloc(svm_node,sub_prob.l);
-#else
-				sub_prob.x = Malloc(svm_node *,sub_prob.l);
-#endif
-				sub_prob.y = Malloc(double,sub_prob.l);
-				int k;
-				for(k=0;k<ci;k++)
-				{
-					sub_prob.x[k] = x[si+k];
-					sub_prob.y[k] = +1;
-				}
-				for(k=0;k<cj;k++)
-				{
-					sub_prob.x[ci+k] = x[sj+k];
-					sub_prob.y[ci+k] = -1;
-				}
-
-				if(param->probability)
-					svm_binary_svc_probability(&sub_prob,param,weighted_C[i],weighted_C[j],probA[p],probB[p]);
-
-				f[p] = svm_train_one(&sub_prob,param,weighted_C[i],weighted_C[j]);
-				for(k=0;k<ci;k++)
-					if(!nonzero[si+k] && fabs(f[p].alpha[k]) > 0)
-						nonzero[si+k] = true;
-				for(k=0;k<cj;k++)
-					if(!nonzero[sj+k] && fabs(f[p].alpha[ci+k]) > 0)
-						nonzero[sj+k] = true;
-				free(sub_prob.x);
-				free(sub_prob.y);
+				int sj = start[j];
+				int cj = count[j];
+                                
+				svm_task *new_task = Malloc(svm_task, 1);
+				new_task->id = p;
+				new_task->sj = sj;
+				new_task->cj = cj;
+				new_task->si = si;
+				new_task->ci = ci;
+				new_task->i = i;
+				new_task->j = j;
+				queue_put(q, new_task);
 				++p;
 			}
+		}
+		join_threads(tids,q, n_threads);
+		free(com_info);
+		queue_destroy(q);
+		p = 0;
+		for(i=0;i<nr_class;i++)
+		{
+			int si = start[i];	
+			int ci = count[i];
+			for(int j=i+1;j<nr_class;j++)
+			{	
+				int sj = start[j];	
+				int cj = count[j];
+				for(int k=0;k<ci;k++)
+					if(!nonzero[si+k] && fabs(f[p].alpha[k]) > 0)
+						nonzero[si+k] = true;
+				for(int k=0;k<cj;k++)
+					if(!nonzero[sj+k] && fabs(f[p].alpha[ci+k]) > 0)
+						nonzero[sj+k] = true;
+				++p;
+			}
+		}
 
 		// build output
 
 		model->nr_class = nr_class;
-		
+	
 		model->label = Malloc(int,nr_class);
 		for(i=0;i<nr_class;i++)
 			model->label[i] = label[i];

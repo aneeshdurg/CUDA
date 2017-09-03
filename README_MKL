@@ -1,0 +1,15 @@
+MKL-Accelerated LIBSVM is a fork of CUDA accelerated LIBSVM, where the cublas calls have been substituted for mkl blas calls. The usage is the same as original LIBSVM. 
+
+PREREQUISITES
+
+    * Intel processor with intel MKL installed
+    * MKL environment variables set with support for 32 bit.
+
+INSTRUCTIONS
+
+    * Install intel MKL
+    * run `source <install-dir>/bin/compilervars.sh ia32`
+    * run `make` in the root directory of this repo
+    * executable is produced as svm-train
+  
+

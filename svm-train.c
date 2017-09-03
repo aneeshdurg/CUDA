@@ -3,6 +3,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+//#include <time.h>
+
 #include "svm.h"
 #define Malloc(type,n) (type *)malloc((n)*sizeof(type))
 
@@ -107,7 +109,13 @@ int main(int argc, char **argv)
 	}
 	else
 	{
-		model = svm_train(&prob,&param);
+		
+                //printf("Timing svm training!\n");
+                //time_t train_start = time(NULL);
+                model = svm_train(&prob,&param);
+                //time_t now = time(NULL);
+                //printf("%ld Seconds elapsed!\n", now-train_start);
+ 
 		if(svm_save_model(model_file_name,model))
 		{
 			fprintf(stderr, "can't save model to file %s\n", model_file_name);

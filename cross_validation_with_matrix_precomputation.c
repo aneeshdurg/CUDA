@@ -32,7 +32,7 @@ void free_pkm(struct svm_problem *p_km)
 
 double do_crossvalidation(struct svm_problem * p_km)
 {
-			double rate;
+			double rate = 0;
 
 			int i;
 			int total_correct = 0;
